@@ -1,3 +1,54 @@
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchWithTimeout(url, options, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function postToFormsWithRetry(FORM_URL, options, retries = 3) {
+  let lastStatus = null;
+  let lastBody = "";
+  let lastErr = null;
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await fetchWithTimeout(FORM_URL, options, 8000);
+      lastStatus = resp.status;
+
+      const text = await resp.text();
+      lastBody = text;
+
+      // Éxito típico en Forms: 200 o 302
+      if (resp.status === 200 || resp.status === 302) {
+        return { resp, text };
+      }
+
+      console.error(`⚠️ Forms intento ${i + 1}/${retries} status=${resp.status} body(200)=`, text.slice(0, 200));
+    } catch (e) {
+      lastErr = e;
+      console.error(`❌ Forms intento ${i + 1}/${retries} error:`, e?.message || e);
+    }
+
+    // backoff corto: 250ms, 750ms, 1750ms
+    const wait = 250 + i * i * 500;
+    await sleep(wait);
+  }
+
+  const err = new Error(
+    lastErr
+      ? `Forms failed after retries: ${lastErr.message || lastErr}`
+      : `Forms bad status after retries: ${lastStatus}`
+  );
+  err.lastStatus = lastStatus;
+  err.lastBody = lastBody;
+  throw err;
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
@@ -7,9 +58,7 @@ module.exports = async (req, res) => {
   const data = req.body || {};
   const parsed =
     typeof data === "string"
-      ? (() => {
-          try { return JSON.parse(data); } catch { return {}; }
-        })()
+      ? (() => { try { return JSON.parse(data); } catch { return {}; } })()
       : data;
 
   const fechaHora = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota" });
@@ -48,40 +97,33 @@ module.exports = async (req, res) => {
   try {
     console.log("✅ Webhook recibido. Keys:", Object.keys(parsed || {}));
     console.log("🧾 Payload mapeado:", {
-      fechaHora,
-      contactId,
-      nombreCompleto,
-      email,
-      telefono,
-      origenFuente,
-      pais,
-      timezone,
-      urlDelFormulario,
-      referrer
+      fechaHora, contactId, nombreCompleto, email, telefono, origenFuente,
+      pais, timezone, urlDelFormulario, referrer
     });
-    console.log("➡️ Enviando a Form:", FORM_URL);
-    console.log("🧾 formParams (primeros 400):", formParams.toString().slice(0, 400));
 
-    const response = await fetch(FORM_URL, {
+    const options = {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0" // a veces ayuda con Forms
+        "User-Agent": "Mozilla/5.0"
       },
       body: formParams.toString(),
-      redirect: "manual" // para ver 302 sin seguirlo
-    });
+      redirect: "manual"
+    };
 
-    const text = await response.text();
+    const { resp, text } = await postToFormsWithRetry(FORM_URL, options, 3);
 
-    console.log("📩 Forms status:", response.status);
-    console.log("📩 Forms location header:", response.headers.get("location"));
-    console.log("📩 Forms body (primeros 300):", text.slice(0, 300));
+    console.log("📩 Forms status final:", resp.status);
+    console.log("📩 Forms body (primeros 200):", text.slice(0, 200));
 
-    const ok = response.status === 200 || response.status === 302;
-    return res.status(200).json({ ok, formStatus: response.status });
+    return res.status(200).json({ ok: true, formStatus: resp.status });
   } catch (err) {
-    console.error("❌ Error enviando a Google Forms:", err);
-    return res.status(200).json({ ok: false, error: err.message });
+    console.error("❌ Falló envío a Forms tras reintentos:", err?.message || err);
+    if (err?.lastStatus) console.error("❌ lastStatus:", err.lastStatus);
+    if (err?.lastBody) console.error("❌ lastBody(200):", (err.lastBody || "").slice(0, 200));
+
+    // Estrategia: responder 200 para que Digital1 no reintente agresivo.
+    // Si prefieres que Digital1 reintente, cambia a res.status(500)
+    return res.status(200).json({ ok: false, error: err?.message || String(err) });
   }
 };
